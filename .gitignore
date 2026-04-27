@@ -1,0 +1,26 @@
+# 環境與金鑰 (絕對不能上傳)
+.env
+
+# 數據與筆記本 (Obsidian Vault)
+pdf2mdVault/**/*
+!pdf2mdVault/**/.gitkeep
+
+# Python 環境與快取
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Docker 與本地日誌
+*.log
+.docker-compose.lock
+
+# 系統雜訊
+.DS_Store
+Thumbs.db
+
+# 編輯器設定
+.vscode/
+.idea/

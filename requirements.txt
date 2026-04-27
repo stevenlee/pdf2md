@@ -1,0 +1,10 @@
+marker-pdf
+typer[all]
+python-dotenv
+openai
+google-generativeai
+pydantic-settings
+rich
+pillow
+python-magic
+aiohttp

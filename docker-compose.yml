@@ -1,0 +1,27 @@
+services:
+  pdf2md:
+    build: .
+    container_name: pdf2md-converter
+    volumes:
+      - ./pdf2mdVault:/app/pdf2mdVault
+      - ./prompts:/app/prompts
+      - ./src:/app/src
+      - /tmp/pdf2md_cache/marker:/root/.cache/marker
+      - /tmp/pdf2md_cache/huggingface:/root/.cache/huggingface
+      - /tmp/pdf2md_cache/datalab:/root/.cache/datalab
+    shm_size: '4gb'  # 增加共享記憶體，防止 PyTorch 崩潰
+    env_file:
+      - .env
+    environment:
+      - TORCH_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/root/.cache/huggingface
+      - MARKER_DATA_DIR=/root/.cache/marker
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
