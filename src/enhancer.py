@@ -13,11 +13,55 @@ class MarkdownEnhancer:
         self.processor = processor
 
     def fix_mermaid_syntax(self, code: str) -> str:
-        """強制為 Mermaid 標籤加上雙引號"""
-        code = re.sub(r'(\w+)\[(?!\")(.*?)\]', r'\1["\2"]', code)
-        code = re.sub(r'(\w+)\((?!\")(.*?)\)', r'\1("\2")', code)
-        code = re.sub(r'(\w+)\{(?!\")(.*?)\}', r'\1{"\2"}', code)
-        return code
+        """強制為 Mermaid 標籤加上雙引號，並將內部的雙引號轉為單引號 (單次替換)"""
+        # 匹配上下文：行首、空格、或是 Mermaid 的箭頭
+        context = r'(^|[\s\-\=>])'
+        # 節點 ID 必須以字母數字或底線開頭，避免匹配到箭頭 (如 -- )
+        id_pattern = r'([a-zA-Z0-9_][a-zA-Z0-9._-]*)'
+        
+        # 定義各類括號的配對 branch，確保非貪婪匹配 (.*?) 能準確停在對應的閉合括號上
+        # 共 7 種括號，對應群組為：
+        # 1: context, 2: ID
+        # 每種括號佔 3 個群組 (ob, content, cb)
+        branches = [
+            r'(\[\[)(.*?)(\]\])',
+            r'(\(\()(.*?)(\)\))',
+            r'(\{\{)(.*?)(\}\})',
+            r'(\[)(.*?)(\])',
+            r'(\()(.*?)(\))',
+            r'(\{)(.*?)(\})',
+            r'(>)(.*?)(\])'
+        ]
+        
+        pattern = context + id_pattern + r'\s*(?:' + '|'.join(branches) + r')'
+        
+        def repl(m):
+            prefix = m.group(1)
+            node_id = m.group(2)
+            
+            # 尋找匹配的 branch (從 group 3 開始，每 3 個為一組)
+            ob, content, cb = None, None, None
+            for i in range(3, 24, 3):
+                if m.group(i) is not None:
+                    ob = m.group(i)
+                    content = m.group(i+1)
+                    cb = m.group(i+2)
+                    break
+                    
+            if content is None:
+                return m.group(0)
+                
+            # 如果內容已經是最外層有引號包覆，我們只處理裡面的引號
+            if content.startswith('"') and content.endswith('"') and len(content) >= 2:
+                inner = content[1:-1]
+                inner = inner.replace('"', "'")
+                return f'{prefix}{node_id}{ob}"{inner}"{cb}'
+                
+            # 如果沒有包覆，則包覆起來，並將內部的雙引號轉為單引號
+            clean_content = content.replace('"', "'")
+            return f'{prefix}{node_id}{ob}"{clean_content}"{cb}'
+
+        return re.sub(pattern, repl, code, flags=re.MULTILINE)
 
     async def process_image(self, img_name: str, img_path: str, output_dir: str) -> tuple[str, str]:
         """非同步處理單張圖片，返回 (舊標籤, 替換文字)"""
