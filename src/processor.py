@@ -14,7 +14,7 @@ class MarkdownProcessor:
     def normalize_latex(self, text: str) -> str:
         """
         將 Marker 產生的 LaTeX 轉換為標準 Markdown 格式。
-        Marker 通常使用 \( \) 或 \[ \]，轉換為 $ $ 或 $$ $$.
+        Marker 通常使用 \\( \\) 或 \\[ \\]，轉換為 $ $ 或 $$ $$.
         """
         # 行內公式
         text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text)

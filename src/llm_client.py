@@ -137,6 +137,44 @@ class LLMClient:
                         raise Exception(f"Ollama API 錯誤: HTTP {response.status} - {text}")
         return "Error: Async vision not supported for this provider yet."
 
+    async def async_vision_to_markdown_table(self, image_path: str) -> str:
+        system_prompt = self._load_prompt("vision_to_markdown_table")
+        provider = settings.OCR_PROVIDER
+        
+        if provider == "ollama":
+            with open(image_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            payload = {
+                "model": settings.OLLAMA_MODEL_OCR,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": system_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+            
+            endpoint = f"{settings.OLLAMA_API_BASE.rstrip('/')}/chat/completions"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(endpoint, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data["choices"][0]["message"]["content"]
+                    else:
+                        text = await response.text()
+                        raise Exception(f"Ollama API 錯誤: HTTP {response.status} - {text}")
+        return "Error: Async OCR table extraction not supported for this provider yet."
+
     def ocr_extract(self, image_path: str):
         """專門用於純文字提取的 OCR 任務"""
         system_prompt = "You are a professional OCR assistant. Extract all text from the image exactly as it appears. Output ONLY the extracted text."

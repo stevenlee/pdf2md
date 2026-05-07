@@ -2,6 +2,7 @@ marker-pdf
 typer[all]
 python-dotenv
 openai
+httpx<0.28
 google-generativeai
 pydantic-settings
 rich
