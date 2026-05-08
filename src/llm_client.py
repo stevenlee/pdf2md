@@ -98,21 +98,24 @@ class LLMClient:
             return response.text
         return "Error: No vision provider configured."
 
-    async def async_vision_to_mermaid(self, image_path: str) -> str:
-        system_prompt = self._load_prompt("vision_to_mermaid")
+    async def _async_vision_call(self, image_path: str, prompt: str, model: str = None) -> str:
+        """通用非同步 vision API 呼叫"""
         provider = settings.VISION_PROVIDER
         
         if provider == "ollama":
+            if model is None:
+                model = settings.OLLAMA_MODEL_VISION
+                
             with open(image_path, "rb") as image_file:
                 base64_image = base64.b64encode(image_file.read()).decode('utf-8')
             
             payload = {
-                "model": settings.OLLAMA_MODEL_VISION,
+                "model": model,
                 "messages": [
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": system_prompt},
+                            {"type": "text", "text": prompt},
                             {
                                 "type": "image_url",
                                 "image_url": {
@@ -124,7 +127,6 @@ class LLMClient:
                 ]
             }
             
-            # OpenAI compatible endpoint on Ollama
             endpoint = f"{settings.OLLAMA_API_BASE.rstrip('/')}/chat/completions"
             
             async with aiohttp.ClientSession() as session:
@@ -137,43 +139,38 @@ class LLMClient:
                         raise Exception(f"Ollama API 錯誤: HTTP {response.status} - {text}")
         return "Error: Async vision not supported for this provider yet."
 
+    async def async_vision_classify(self, image_path: str) -> str:
+        """非同步分類圖片類型：TABLE / DOCUMENT / DIAGRAM / OTHER"""
+        prompt = self._load_prompt("vision_classify")
+        result = await self._async_vision_call(
+            image_path, prompt, model=settings.OLLAMA_MODEL_VISION
+        )
+        # 從回應中提取分類結果 (LLM 可能會附帶解釋)
+        result_clean = result.strip().upper()
+        for category in ["DOCUMENT", "TABLE", "DIAGRAM", "OTHER"]:
+            if category in result_clean:
+                return category
+        # 預設歸類為 DOCUMENT（比較安全的 fallback）
+        return "DOCUMENT"
+
+    async def async_vision_to_mermaid(self, image_path: str) -> str:
+        prompt = self._load_prompt("vision_to_mermaid")
+        return await self._async_vision_call(
+            image_path, prompt, model=settings.OLLAMA_MODEL_VISION
+        )
+
     async def async_vision_to_markdown_table(self, image_path: str) -> str:
-        system_prompt = self._load_prompt("vision_to_markdown_table")
-        provider = settings.OCR_PROVIDER
-        
-        if provider == "ollama":
-            with open(image_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            payload = {
-                "model": settings.OLLAMA_MODEL_OCR,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": system_prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}",
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-            
-            endpoint = f"{settings.OLLAMA_API_BASE.rstrip('/')}/chat/completions"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(endpoint, json=payload) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data["choices"][0]["message"]["content"]
-                    else:
-                        text = await response.text()
-                        raise Exception(f"Ollama API 錯誤: HTTP {response.status} - {text}")
-        return "Error: Async OCR table extraction not supported for this provider yet."
+        prompt = self._load_prompt("vision_to_markdown_table")
+        return await self._async_vision_call(
+            image_path, prompt, model=settings.OLLAMA_MODEL_OCR
+        )
+
+    async def async_vision_to_document(self, image_path: str) -> str:
+        """非同步將文件/表單圖片轉換為 Markdown（包含文字、表格、checkbox 等混合內容）"""
+        prompt = self._load_prompt("vision_to_document")
+        return await self._async_vision_call(
+            image_path, prompt, model=settings.OLLAMA_MODEL_OCR
+        )
 
     def ocr_extract(self, image_path: str):
         """專門用於純文字提取的 OCR 任務"""
