@@ -99,17 +99,27 @@ class LLMClient:
             return response.text
         return "Error: No vision provider configured."
 
-    async def _async_vision_call(self, image_path: str, prompt: str, model: str = None) -> str:
-        """通用非同步 vision API 呼叫"""
+    @staticmethod
+    def _read_image_b64(image_path: str) -> str:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
+    async def _async_vision_call(
+        self, image_path: str, prompt: str, model: str = None, session=None
+    ) -> str:
+        """通用非同步 vision API 呼叫。
+
+        session 可由呼叫端傳入以重用連線；未提供時自建臨時 session。
+        檔案讀取與 base64 編碼移到執行緒，避免阻塞 event loop。
+        """
         provider = settings.VISION_PROVIDER
-        
+
         if provider == "ollama":
             if model is None:
                 model = settings.OLLAMA_MODEL_VISION
-                
-            with open(image_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-            
+
+            base64_image = await asyncio.to_thread(self._read_image_b64, image_path)
+
             payload = {
                 "model": model,
                 "messages": [
@@ -127,16 +137,19 @@ class LLMClient:
                     }
                 ]
             }
-            
+
             endpoint = f"{settings.OLLAMA_API_BASE.rstrip('/')}/chat/completions"
-            
-            timeout = aiohttp.ClientTimeout(total=settings.VISION_REQUEST_TIMEOUT)
+
             attempts = max(1, settings.VISION_REQUEST_RETRIES + 1)
             last_error = None
 
-            for attempt in range(attempts):
-                try:
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
+            owns_session = session is None
+            if owns_session:
+                timeout = aiohttp.ClientTimeout(total=settings.VISION_REQUEST_TIMEOUT)
+                session = aiohttp.ClientSession(timeout=timeout)
+            try:
+                for attempt in range(attempts):
+                    try:
                         async with session.post(endpoint, json=payload) as response:
                             if response.status == 200:
                                 data = await response.json()
@@ -147,46 +160,42 @@ class LLMClient:
                             if response.status not in (408, 429, 500, 502, 503, 504):
                                 raise error
                             last_error = error
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    last_error = e
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        last_error = e
 
-                if attempt < attempts - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    if attempt < attempts - 1:
+                        await asyncio.sleep(2 ** attempt)
+            finally:
+                if owns_session:
+                    await session.close()
 
-            raise Exception(f"Ollama API 重試後仍失敗: {last_error}")
+            # 帶上例外類型，避免 TimeoutError 等 str() 為空時 log 看不出原因
+            detail = f"{type(last_error).__name__}: {last_error}" if last_error else "未知錯誤"
+            raise Exception(f"Ollama API 重試後仍失敗: {detail}")
         return "Error: Async vision not supported for this provider yet."
 
-    async def async_vision_classify(self, image_path: str) -> str:
-        """非同步分類圖片類型：TABLE / DOCUMENT / DIAGRAM / OTHER"""
-        prompt = self._load_prompt("vision_classify")
-        result = await self._async_vision_call(
-            image_path, prompt, model=settings.OLLAMA_MODEL_VISION
-        )
-        # 從回應中提取分類結果 (LLM 可能會附帶解釋)
-        result_clean = result.strip().upper()
-        for category in ["DOCUMENT", "TABLE", "DIAGRAM", "OTHER"]:
-            if category in result_clean:
-                return category
-        # 預設歸類為 DOCUMENT（比較安全的 fallback）
-        return "DOCUMENT"
+    @staticmethod
+    def make_session() -> "aiohttp.ClientSession":
+        """建立一個帶逾時設定的 ClientSession，供單一檔案的多張圖片重用連線。"""
+        timeout = aiohttp.ClientTimeout(total=settings.VISION_REQUEST_TIMEOUT)
+        return aiohttp.ClientSession(timeout=timeout)
 
-    async def async_vision_to_mermaid(self, image_path: str) -> str:
-        prompt = self._load_prompt("vision_to_mermaid")
+    async def async_vision_smart_convert(self, image_path: str, session=None) -> str:
+        """單次呼叫：同時分類並轉換圖片。
+
+        回應第一行為 `TYPE: <TABLE|DOCUMENT|DIAGRAM|OTHER>`，其後為對應格式的內容。
+        以一次 vision round-trip 取代原本的「分類 + 轉換」兩次呼叫。
+        """
+        prompt = self._load_prompt("vision_smart_convert")
         return await self._async_vision_call(
-            image_path, prompt, model=settings.OLLAMA_MODEL_VISION
+            image_path, prompt, model=settings.OLLAMA_MODEL_SMART, session=session
         )
 
-    async def async_vision_to_markdown_table(self, image_path: str) -> str:
-        prompt = self._load_prompt("vision_to_markdown_table")
-        return await self._async_vision_call(
-            image_path, prompt, model=settings.OLLAMA_MODEL_OCR
-        )
-
-    async def async_vision_to_document(self, image_path: str) -> str:
-        """非同步將文件/表單圖片轉換為 Markdown（包含文字、表格、checkbox 等混合內容）"""
+    async def async_vision_to_document(self, image_path: str, session=None) -> str:
+        """文件/表單 OCR：用於 DIAGRAM 轉 Mermaid 失敗時的降級提取。"""
         prompt = self._load_prompt("vision_to_document")
         return await self._async_vision_call(
-            image_path, prompt, model=settings.OLLAMA_MODEL_OCR
+            image_path, prompt, model=settings.OLLAMA_MODEL_OCR, session=session
         )
 
     def ocr_extract(self, image_path: str):

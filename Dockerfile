@@ -33,4 +33,5 @@ COPY . .
 RUN chmod +x start.sh
 
 # 預設執行指令 (使用 python3 並強制覆蓋舊檔)
-CMD ["python3", "-m", "src.cli", "--input", "input_dir", "--output", "output_dir", "--workers", "8", "--force", "--no-keep-raw"]
+# --workers 1: 有效 vision 併發 = workers × VISION_MAX_CONCURRENCY，單 GPU 下維持 1 靠檔案內併發即可
+CMD ["python3", "-m", "src.cli", "--input", "input_dir", "--output", "output_dir", "--workers", "1", "--force", "--no-keep-raw"]

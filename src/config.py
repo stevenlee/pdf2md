@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     OLLAMA_MODEL_TEXT: str = "qwen3.6:latest"
     OLLAMA_MODEL_VISION: str = "gemma4:26b"
     OLLAMA_MODEL_OCR: str = "glm-ocr:latest"
+    # 單次「分類+轉換」合併呼叫所用的模型。預設用 26b 以保圖表/文件保真度；
+    # 圖表簡單或趕時間時，可於 .env 改成 gemma4:e4b 換取約 4× 速度。
+    OLLAMA_MODEL_SMART: str = "gemma4:26b"
 
     # 路由設定
     TEXT_PROVIDER: str = "vllm"        # 文字任務由 vLLM 處理 (gpt-oss-20b)
@@ -26,7 +29,7 @@ class Settings(BaseSettings):
 
     # Vision/OCR stability
     VISION_MAX_CONCURRENCY: int = 2
-    VISION_REQUEST_TIMEOUT: int = 180
+    VISION_REQUEST_TIMEOUT: int = 600
     VISION_REQUEST_RETRIES: int = 2
 
     # Gemini

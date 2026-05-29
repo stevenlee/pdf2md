@@ -73,89 +73,155 @@ class MarkdownEnhancer:
         text = re.sub(r'```(?:markdown|md)?|```', '', text).strip()
         return text
 
-    def fix_mermaid_syntax(self, code: str) -> str:
-        """強制為 Mermaid 標籤加上雙引號，並將內部的雙引號轉為單引號 (單次替換)"""
-        # 匹配上下文：行首、空格、或是 Mermaid 的箭頭
-        context = r'(^|[\s\-\=\>])'
-        # 節點 ID 必須以字母數字或底線開頭，避免匹配到箭頭 (如 -- )
-        id_pattern = r'([a-zA-Z0-9_][a-zA-Z0-9._-]*)'
-        
-        # 定義各類括號的配對 branch，確保非貪婪匹配 (.*?) 能準確停在對應的閉合括號上
-        # 共 7 種括號，對應群組為：
-        # 1: context, 2: ID
-        # 每種括號佔 3 個群組 (ob, content, cb)
-        branches = [
-            r'(\[\[)(.*?)(\]\])',
-            r'(\(\()(.*?)(\)\))',
-            r'(\{\{)(.*?)(\}\})',
-            r'(\[)(.*?)(\])',
-            r'(\()(.*?)(\))',
-            r'(\{)(.*?)(\})',
-            r'(>)(.*?)(\])'
-        ]
-        
-        pattern = context + id_pattern + r'\s*(?:' + '|'.join(branches) + r')'
-        
-        def repl(m):
-            prefix = m.group(1)
-            node_id = m.group(2)
-            
-            # 尋找匹配的 branch (從 group 3 開始，每 3 個為一組)
-            ob, content, cb = None, None, None
-            for i in range(3, 24, 3):
-                if m.group(i) is not None:
-                    ob = m.group(i)
-                    content = m.group(i+1)
-                    cb = m.group(i+2)
-                    break
-                    
-            if content is None:
-                return m.group(0)
-                
-            # 如果內容已經是最外層有引號包覆，我們只處理裡面的引號
-            if content.startswith('"') and content.endswith('"') and len(content) >= 2:
-                inner = content[1:-1]
-                inner = inner.replace('"', "'")
-                return f'{prefix}{node_id}{ob}"{inner}"{cb}'
-                
-            # 如果沒有包覆，則包覆起來，並將內部的雙引號轉為單引號
-            clean_content = content.replace('"', "'")
-            return f'{prefix}{node_id}{ob}"{clean_content}"{cb}'
+    # Mermaid 節點外框：開括號 -> 對應閉括號（長者優先，確保 `[[` 早於 `[`）
+    _MERMAID_SHAPES = [
+        ("[[", "]]"), ("((", "))"), ("{{", "}}"),
+        ("([", "])"), ("[(", ")]"),
+        ("[/", "/]"), ("[\\", "\\]"),
+        ("[", "]"), ("(", ")"), ("{", "}"), (">", "]"),
+    ]
 
-        return re.sub(pattern, repl, code, flags=re.MULTILINE)
+    # 邊標籤結束的終止字元：link 運算子開頭 (- = <)、管線、或行尾
+    _EDGE_TERMINATORS = "-=<|"
+
+    def fix_mermaid_syntax(self, code: str) -> str:
+        """為 Mermaid 標籤補上雙引號並修正巢狀引號。
+
+        單次掃描狀態機，認得三種標籤：
+        - 節點外框 `ID[...]`/`ID{...}`/`ID(...)` 等
+        - 管線邊標籤 `-->|...|`
+        - link 邊標籤 `-- "..." -->`
+
+        關鍵設計：一旦進入引號字串就不再觸發節點偵測，避免標籤內的
+        `_{...}` (如 LaTeX 下標 FS_{t+1}) 被誤判為菱形節點；邊標籤的閉引號
+        以「後接 link 運算子/管線/行尾」判定，因此 `{}` 會被當文字而非結束。
+        巢狀雙引號一律轉為單引號。
+        """
+        return "\n".join(self._fix_mermaid_line(line) for line in code.splitlines())
+
+    def _fix_mermaid_line(self, line: str) -> str:
+        out = []
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
+
+            # (1) 節點外框
+            shape = self._match_shape_open(line, i)
+            if shape is not None:
+                ob, cb = shape
+                consumed = self._consume_node_label(line, i + len(ob), cb)
+                if consumed is not None:
+                    label, end = consumed
+                    out.append(f'{ob}"{label}"{cb}')
+                    i = end
+                    continue
+
+            # (2) 管線邊標籤 |...|
+            if ch == '|':
+                consumed = self._consume_pipe_label(line, i + 1)
+                if consumed is not None:
+                    label, end = consumed
+                    out.append(f'|"{label}"|')
+                    i = end
+                    continue
+
+            # (3) link 邊標籤：前接 link 運算子的引號字串
+            if ch == '"' and self._prev_nonspace_is_link(line, i):
+                consumed = self._consume_edge_label(line, i)
+                if consumed is not None:
+                    label, end = consumed
+                    out.append(f'"{label}"')
+                    i = end
+                    continue
+
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def _match_shape_open(self, line: str, i: int):
+        """若 line[i] 是節點外框的開頭（且前一字元為節點 ID），回傳 (開, 閉)。"""
+        if line[i] not in "[({>":
+            return None
+        prev = line[i - 1] if i > 0 else ""
+        if not (prev.isalnum() or prev == "_"):
+            return None
+        for ob, cb in self._MERMAID_SHAPES:
+            if line.startswith(ob, i):
+                return ob, cb
+        return None
+
+    def _prev_nonspace_is_link(self, line: str, i: int) -> bool:
+        """往回略過空白，判斷前一個非空白字元是否為 link 運算子結尾。"""
+        j = i - 1
+        while j >= 0 and line[j] == ' ':
+            j -= 1
+        return j >= 0 and line[j] in "-=.>"
+
+    def _consume_node_label(self, line: str, start: int, cb: str):
+        """取出節點標籤，回傳 (正規化標籤, 含閉括號後的結束索引)。"""
+        n = len(line)
+        if line[start:].lstrip().startswith('"'):
+            j = start
+            while j < n and line[j] == ' ':
+                j += 1
+            k = j + 1  # 略過開引號
+            buf = []
+            while k < n:
+                if line[k] == '"':
+                    m = k + 1
+                    while m < n and line[m] == ' ':
+                        m += 1
+                    if line.startswith(cb, m):  # 後接閉括號 -> 真正的閉引號
+                        return "".join(buf), m + len(cb)
+                    buf.append("'")  # 巢狀引號
+                    k += 1
+                else:
+                    buf.append(line[k])
+                    k += 1
+            return None  # 引號未閉合
+        idx = line.find(cb, start)
+        if idx == -1:
+            return None
+        return line[start:idx].strip().replace('"', "'"), idx + len(cb)
+
+    def _consume_pipe_label(self, line: str, start: int):
+        """取出 |...| 邊標籤，回傳 (正規化標籤, 含閉管線後的結束索引)。"""
+        idx = line.find('|', start)
+        if idx == -1:
+            return None
+        content = line[start:idx].strip()
+        if len(content) >= 2 and content.startswith('"') and content.endswith('"'):
+            content = content[1:-1]
+        return content.replace('"', "'"), idx + 1
+
+    def _consume_edge_label(self, line: str, qpos: int):
+        """取出 link 邊標籤的引號字串，回傳 (正規化標籤, 閉引號後的結束索引)。
+
+        閉引號判定：其後（略過空白）為 link 運算子/管線/行尾，因此標籤文字內
+        的 `}`/`]` 等不會被誤判為結束。
+        """
+        n = len(line)
+        k = qpos + 1
+        buf = []
+        while k < n:
+            if line[k] == '"':
+                m = k + 1
+                while m < n and line[m] == ' ':
+                    m += 1
+                if m >= n or line[m] in self._EDGE_TERMINATORS:
+                    return "".join(buf), k + 1
+                buf.append("'")  # 巢狀引號
+                k += 1
+            else:
+                buf.append(line[k])
+                k += 1
+        return None
 
     def validate_mermaid(self, code: str) -> str:
-        """驗證並修復常見的 Mermaid 語法問題"""
+        """驗證並修復常見的 Mermaid 語法問題（不再盲目補括號，避免破壞已配對標籤）。"""
         lines = code.strip().splitlines()
-        fixed_lines = []
-        
-        for line in lines:
-            stripped = line.strip()
-            
-            # 移除空行
-            if not stripped:
-                fixed_lines.append(line)
-                continue
-            
-            # 修復常見問題：行尾多餘的分號
-            stripped = stripped.rstrip(';')
-            
-            # 修復常見問題：節點定義中的未閉合括號
-            # 計算括號平衡
-            open_sq = stripped.count('[') - stripped.count(']')
-            open_rnd = stripped.count('(') - stripped.count(')')
-            open_curl = stripped.count('{') - stripped.count('}')
-            
-            # 嘗試修復未閉合括號
-            if open_sq > 0:
-                stripped += ']' * open_sq
-            if open_rnd > 0:
-                stripped += ')' * open_rnd
-            if open_curl > 0:
-                stripped += '}' * open_curl
-            
-            fixed_lines.append(stripped)
-        
+        fixed_lines = [line.rstrip().rstrip(';') if line.strip() else line for line in lines]
         result = '\n'.join(fixed_lines)
         
         # 確保第一行是 diagram type declaration
@@ -196,6 +262,42 @@ class MarkdownEnhancer:
         
         return has_keyword and has_structure and has_content
 
+    def _parse_smart_output(self, raw: str) -> tuple[str, str]:
+        """解析合併呼叫的輸出，回傳 (TYPE, 內容)。"""
+        text = re.sub(r'```[a-zA-Z]*\n?|```', '', raw).strip()
+        lines = text.splitlines()
+        if not lines:
+            return "OTHER", ""
+        m = re.match(r'\s*TYPE:\s*(TABLE|DOCUMENT|DIAGRAM|OTHER)\s*$', lines[0], re.IGNORECASE)
+        if m:
+            return m.group(1).upper(), "\n".join(lines[1:]).strip()
+        # 模型未遵守格式時，從整段內容偵測型別
+        upper = text.upper()
+        for category in ("DIAGRAM", "TABLE", "DOCUMENT"):
+            if upper.startswith(f"TYPE: {category}") or upper.startswith(category):
+                body = re.sub(r'^\s*(TYPE:\s*)?' + category + r'\s*', '', text, count=1, flags=re.IGNORECASE)
+                return category, body.strip()
+        return "DOCUMENT", text
+
+    def _format_diagram(self, content: str) -> str | None:
+        clean = re.sub(r'(```mermaid|```)', '', content).strip()
+        if not self.is_valid_mermaid(clean):
+            return None
+        fixed = self.validate_mermaid(self.fix_mermaid_syntax(clean))
+        return f"\n\n```mermaid\n{fixed}\n```\n\n"
+
+    def _format_table(self, content: str) -> tuple[str, str] | None:
+        clean = self.clean_markdown_table(content)
+        if self.is_markdown_table(clean):
+            return f"\n\n{clean}\n\n", "原始表格圖片比對"
+        return None
+
+    def _format_document(self, content: str) -> tuple[str, str] | None:
+        clean = self.clean_document_output(content)
+        if self.is_valid_document_output(clean):
+            return f"\n\n{clean}\n\n", "原始文件圖片比對"
+        return None
+
     async def process_image(
         self,
         img_name: str,
@@ -203,133 +305,73 @@ class MarkdownEnhancer:
         output_dir: str,
         convert_mermaid: bool = True,
         convert_tables: bool = True,
+        max_retries: int = 2,
+        session=None,
     ) -> tuple[str, str]:
-        """非同步處理單張圖片，返回 (舊標籤, 替換文字)
+        """非同步處理單張圖片，返回 (舊標籤, 替換文字)。
 
-        處理流程:
-        1. 先用 vision 模型分類圖片類型 (TABLE / DOCUMENT / DIAGRAM / OTHER)
-        2. 根據分類結果路由到對應的轉換管道
+        單次呼叫同時完成分類與轉換（合併原本的 classify + convert 兩段呼叫）；
+        DIAGRAM 若驗證失敗會重試。session 可重用以共享連線。
         """
         logger.info(f"開始非同步轉換圖片: {img_name}")
-        try:
-            from src.llm_client import llm_client
-            
-            # ===== Stage 1: 圖片分類 =====
-            img_type = await llm_client.async_vision_classify(img_path)
-            logger.info(f"圖片 {img_name} 分類結果: {img_type}")
-            
-            # ===== Stage 2: 根據分類路由 =====
+        from src.llm_client import llm_client
+        img_rel_path = os.path.relpath(img_path, output_dir)
+        keep_original = (f"![]({img_name})", f"![]({img_rel_path})")
+        diagram_failed = False
 
-            # --- TABLE: 純表格提取 ---
-            if img_type == "TABLE" and convert_tables:
-                result = await self._handle_table(llm_client, img_name, img_path, output_dir)
-                if result:
-                    return result
-
-            # --- DOCUMENT: 文件/表單提取 (文字 + 表格混合) ---
-            if img_type == "DOCUMENT" and convert_tables:
-                result = await self._handle_document(llm_client, img_name, img_path, output_dir)
-                if result:
-                    return result
-            
-            # --- DIAGRAM: Mermaid 圖表轉換 ---
-            if img_type == "DIAGRAM" and convert_mermaid:
-                result = await self._handle_mermaid(llm_client, img_name, img_path, output_dir)
-                if result:
-                    return result
-            
-            # --- Fallback: 分類不明確時的智慧路由 ---
-            if img_type == "OTHER" or img_type not in ("TABLE", "DOCUMENT", "DIAGRAM"):
-                # 先嘗試 document 提取
-                if convert_tables:
-                    result = await self._handle_document(llm_client, img_name, img_path, output_dir)
-                    if result:
-                        return result
-            
-            # 保留原始圖片
-            logger.info(f"{img_name} 無法轉換為結構化格式，保留原始圖片")
-            img_rel_path = os.path.relpath(img_path, output_dir)
-            return f"![]({img_name})", f"![]({img_rel_path})"
-        except Exception as e:
-            logger.error(f"轉換 {img_name} 失敗: {e}")
-            img_rel_path = os.path.relpath(img_path, output_dir)
-            return f"![]({img_name})", f"![]({img_rel_path})"
-
-    async def _handle_table(
-        self, llm_client, img_name: str, img_path: str, output_dir: str
-    ) -> tuple[str, str] | None:
-        """處理純表格類型圖片"""
-        try:
-            table_text = await llm_client.async_vision_to_markdown_table(img_path)
-            clean_table = self.clean_markdown_table(table_text)
-            
-            if self.is_markdown_table(clean_table):
-                img_rel_path = os.path.relpath(img_path, output_dir)
-                replacement = (
-                    f"\n\n{clean_table}\n\n"
-                    f"> [!NOTE]\n"
-                    f"> 原始表格圖片比對: ![]({img_rel_path})\n"
-                )
-                return f"![]({img_name})", replacement
-        except Exception as e:
-            logger.warning(f"表格 OCR {img_name} 失敗: {e}")
-        return None
-
-    async def _handle_document(
-        self, llm_client, img_name: str, img_path: str, output_dir: str
-    ) -> tuple[str, str] | None:
-        """處理文件/表單類型圖片（文字 + 表格混合內容）"""
-        try:
-            doc_text = await llm_client.async_vision_to_document(img_path)
-            clean_doc = self.clean_document_output(doc_text)
-            
-            if self.is_valid_document_output(clean_doc):
-                img_rel_path = os.path.relpath(img_path, output_dir)
-                replacement = (
-                    f"\n\n{clean_doc}\n\n"
-                    f"> [!NOTE]\n"
-                    f"> 原始文件圖片比對: ![]({img_rel_path})\n"
-                )
-                return f"![]({img_name})", replacement
-        except Exception as e:
-            logger.warning(f"文件 OCR {img_name} 失敗: {e}")
-        return None
-
-    async def _handle_mermaid(
-        self, llm_client, img_name: str, img_path: str, output_dir: str,
-        max_retries: int = 2,
-    ) -> tuple[str, str] | None:
-        """處理圖表類型圖片，轉換為 Mermaid。支援重試以提升穩定性。"""
-        for attempt in range(max_retries):
+        for attempt in range(max(1, max_retries)):
             try:
-                mermaid_code = await llm_client.async_vision_to_mermaid(img_path)
-                
-                # 移除 fence
-                clean_mermaid = re.sub(r'(```mermaid|```)', '', mermaid_code).strip()
-                
-                # 驗證是否為有效 Mermaid
-                if not self.is_valid_mermaid(clean_mermaid):
-                    logger.warning(
-                        f"Mermaid 第 {attempt+1} 次嘗試無效 ({img_name})，"
-                        + ("重試中..." if attempt < max_retries - 1 else "放棄")
-                    )
-                    continue
-                
-                # 修復語法
-                fixed_mermaid = self.fix_mermaid_syntax(clean_mermaid)
-                # 額外驗證修復
-                fixed_mermaid = self.validate_mermaid(fixed_mermaid)
-                
-                img_rel_path = os.path.relpath(img_path, output_dir)
+                raw = await llm_client.async_vision_smart_convert(img_path, session=session)
+            except Exception as e:
+                logger.warning(f"轉換 {img_name} 第 {attempt+1} 次失敗: {e}")
+                continue
+
+            img_type, content = self._parse_smart_output(raw)
+            logger.info(f"圖片 {img_name} 分類結果: {img_type}")
+
+            if img_type == "DIAGRAM" and convert_mermaid:
+                block = self._format_diagram(content)
+                if block:
+                    replacement = f"{block}> [!NOTE]\n> 原始圖片比對: ![]({img_rel_path})\n"
+                    return f"![]({img_name})", replacement
+                diagram_failed = True
+                logger.warning(f"Mermaid 無效 ({img_name})，第 {attempt+1} 次，重試中...")
+                continue  # 圖表才重試（模型輸出不穩定）
+
+            if convert_tables and img_type in ("TABLE", "DOCUMENT", "OTHER"):
+                formatter = self._format_table if img_type == "TABLE" else self._format_document
+                result = formatter(content)
+                if result:
+                    body, note = result
+                    replacement = f"{body}> [!NOTE]\n> {note}: ![]({img_rel_path})\n"
+                    return f"![]({img_name})", replacement
+
+            break  # 非圖表類型不重試
+
+        # 降級：圖表轉 Mermaid 失敗（常見於節點內含複雜子圖），改用 OCR 至少抽出文字標籤
+        if diagram_failed and convert_tables:
+            result = await self._fallback_document_ocr(llm_client, img_name, img_path, session)
+            if result:
+                body, _ = result
+                logger.info(f"{img_name} Mermaid 失敗，已降級為 OCR 文字 + 原圖")
                 replacement = (
-                    f"\n\n```mermaid\n{fixed_mermaid}\n```\n\n"
-                    f"> [!NOTE]\n"
-                    f"> 原始圖片比對: ![]({img_rel_path})\n"
+                    f"{body}> [!NOTE]\n> 原始圖表 (Mermaid 轉換失敗，僅供比對): "
+                    f"![]({img_rel_path})\n"
                 )
                 return f"![]({img_name})", replacement
-            except Exception as e:
-                logger.warning(f"Mermaid 轉換 {img_name} 第 {attempt+1} 次失敗: {e}")
-        return None
+
+        logger.info(f"{img_name} 無法轉換為結構化格式，保留原始圖片")
+        return keep_original
+
+    async def _fallback_document_ocr(
+        self, llm_client, img_name: str, img_path: str, session=None
+    ) -> tuple[str, str] | None:
+        try:
+            doc_text = await llm_client.async_vision_to_document(img_path, session=session)
+            return self._format_document(doc_text)
+        except Exception as e:
+            logger.warning(f"降級 OCR {img_name} 失敗: {e}")
+            return None
 
     async def enhance_async(
         self,
@@ -346,10 +388,12 @@ class MarkdownEnhancer:
         
         img_subdir = os.path.join(output_dir, "images", raw_md_path.name.replace("_raw.md", ""))
         
-        tasks = []
+        from src.llm_client import llm_client
+
+        tasks_meta = []  # (img_name, img_path)
         semaphore = asyncio.Semaphore(max(1, settings.VISION_MAX_CONCURRENCY))
 
-        async def process_image_limited(img_name: str, img_path: str):
+        async def process_image_limited(img_name: str, img_path: str, session):
             async with semaphore:
                 return await self.process_image(
                     img_name,
@@ -357,23 +401,28 @@ class MarkdownEnhancer:
                     output_dir,
                     convert_mermaid=convert_mermaid,
                     convert_tables=convert_tables,
+                    session=session,
                 )
 
         for img_name in img_tags:
             img_path = os.path.join(img_subdir, img_name)
             if os.path.exists(img_path) and (convert_mermaid or convert_tables):
-                tasks.append(process_image_limited(img_name, img_path))
+                tasks_meta.append((img_name, img_path))
             elif os.path.exists(img_path):
                 # 只是修正路徑
                 img_rel_path = os.path.relpath(img_path, output_dir)
                 full_text = full_text.replace(f"![]({img_name})", f"![]({img_rel_path})")
-                
-        if tasks:
+
+        if tasks_meta:
             logger.info(
-                f"正在並發處理 {len(tasks)} 張圖片 "
+                f"正在並發處理 {len(tasks_meta)} 張圖片 "
                 f"(上限 {settings.VISION_MAX_CONCURRENCY})..."
             )
-            results = await asyncio.gather(*tasks)
+            # 單一檔案的所有圖片共用一個 session，重用連線
+            async with llm_client.make_session() as session:
+                results = await asyncio.gather(
+                    *(process_image_limited(n, p, session) for n, p in tasks_meta)
+                )
             for old_tag, new_tag in results:
                 full_text = full_text.replace(old_tag, new_tag)
 
@@ -398,13 +447,16 @@ class MarkdownEnhancer:
         convert_tables: bool = True,
     ) -> str:
         os.makedirs(output_dir, exist_ok=True)
-        old_tag, replacement = await self.process_image(
-            image_path.name,
-            str(image_path),
-            output_dir,
-            convert_mermaid=convert_mermaid,
-            convert_tables=convert_tables,
-        )
+        from src.llm_client import llm_client
+        async with llm_client.make_session() as session:
+            old_tag, replacement = await self.process_image(
+                image_path.name,
+                str(image_path),
+                output_dir,
+                convert_mermaid=convert_mermaid,
+                convert_tables=convert_tables,
+                session=session,
+            )
         final_path = os.path.join(output_dir, f"{image_path.stem}.md")
         
         if replacement == old_tag:

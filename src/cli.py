@@ -17,7 +17,11 @@ def batch_convert(
     output_dir: Path = typer.Option(..., "--output", "-o", help="儲存 Markdown 檔案的輸出目錄"),
     mermaid: bool = typer.Option(True, "--mermaid/--no-mermaid", help="是否嘗試將圖表轉換為 Mermaid"),
     tables: bool = typer.Option(True, "--tables/--no-tables", help="是否嘗試將表格圖片轉換為 Markdown table"),
-    workers: int = typer.Option(4, "--workers", "-w", help="並行處理的執行緒數量"),
+    workers: int = typer.Option(
+        1, "--workers", "-w",
+        help="同時處理的檔案數 (執行緒)。注意：有效 vision 併發 = workers × VISION_MAX_CONCURRENCY，"
+             "單 GPU 環境建議維持 1，靠檔案內的 vision 併發即可，避免灌爆 GPU 造成逾時。",
+    ),
     force: bool = typer.Option(False, "--force", "-f", help="強制重新轉換已存在的檔案"),
     keep_raw: bool = typer.Option(False, "--keep-raw/--no-keep-raw", help="是否保留第一階段產生的 *_raw.md 參考檔"),
 ):
