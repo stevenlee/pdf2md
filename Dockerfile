@@ -33,4 +33,4 @@ COPY . .
 RUN chmod +x start.sh
 
 # 預設執行指令 (使用 python3 並強制覆蓋舊檔)
-CMD ["python3", "-m", "src.cli", "--input", "input_dir", "--output", "output_dir", "--workers", "8", "--force"]
+CMD ["python3", "-m", "src.cli", "--input", "input_dir", "--output", "output_dir", "--workers", "8", "--force", "--no-keep-raw"]

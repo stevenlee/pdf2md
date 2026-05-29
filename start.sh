@@ -66,6 +66,6 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 # export TORCH_DEVICE=mps
 # export PYTORCH_ENABLE_MPS_FALLBACK=1
 
-python -m src.cli --input "$INPUT_DIR" --output "$OUTPUT_DIR" --workers 2
+python -m src.cli --input "$INPUT_DIR" --output "$OUTPUT_DIR" --workers 2 --no-keep-raw
 
 echo "✅ 轉換完成！請查看 $OUTPUT_DIR 目錄。"

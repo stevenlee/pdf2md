@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     VISION_PROVIDER: str = "ollama"    # 視覺任務由 Ollama 處理 (gemma4)
     OCR_PROVIDER: str = "ollama"      # OCR 任務由 Ollama 處理 (glm-ocr)
 
+    # Vision/OCR stability
+    VISION_MAX_CONCURRENCY: int = 2
+    VISION_REQUEST_TIMEOUT: int = 180
+    VISION_REQUEST_RETRIES: int = 2
+
     # Gemini
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_MODEL: str = "gemini-2.5-flash"

@@ -4,8 +4,22 @@ import asyncio
 import logging
 from pathlib import Path
 from src.processor import processor
+from src.config import settings
 
 logger = logging.getLogger(__name__)
+
+DOCUMENT_PROMPT_LEAK_PATTERNS = [
+    "目標與投資細節",
+    "OBJECTIVE AND INVESTMENT DETAILS",
+    "風險承受度 Risk Exposure",
+    "帳戶投資目標 Account Investment Objectives",
+    "其他投資 Other Investments",
+    "[visible section title]",
+    "[visible field label]",
+    "[visible column A]",
+    "[visible cell A1]",
+]
+
 
 class MarkdownEnhancer:
     def __init__(self):
@@ -34,6 +48,8 @@ class MarkdownEnhancer:
         text = text.strip()
         if not text or len(text) < 20:
             return False
+        if self.has_document_prompt_leak(text):
+            return False
         # 應至少包含一些結構性標記（標題、表格、粗體等）
         has_heading = bool(re.search(r'^#{1,4}\s', text, re.MULTILINE))
         has_table = "|" in text and "---" in text
@@ -42,6 +58,15 @@ class MarkdownEnhancer:
         # 至少有其中兩項
         score = sum([has_heading, has_table, has_bold, has_checkbox])
         return score >= 1
+
+    def has_document_prompt_leak(self, text: str) -> bool:
+        """偵測 vision_to_document 舊範例被模型複製到輸出的情況。"""
+        normalized = re.sub(r"\s+", " ", text)
+        matches = sum(
+            1 for pattern in DOCUMENT_PROMPT_LEAK_PATTERNS
+            if pattern in normalized
+        )
+        return matches >= 2
 
     def clean_document_output(self, text: str) -> str:
         """清理文件 OCR 輸出，移除多餘的 fence。"""
@@ -322,25 +347,32 @@ class MarkdownEnhancer:
         img_subdir = os.path.join(output_dir, "images", raw_md_path.name.replace("_raw.md", ""))
         
         tasks = []
+        semaphore = asyncio.Semaphore(max(1, settings.VISION_MAX_CONCURRENCY))
+
+        async def process_image_limited(img_name: str, img_path: str):
+            async with semaphore:
+                return await self.process_image(
+                    img_name,
+                    img_path,
+                    output_dir,
+                    convert_mermaid=convert_mermaid,
+                    convert_tables=convert_tables,
+                )
+
         for img_name in img_tags:
             img_path = os.path.join(img_subdir, img_name)
             if os.path.exists(img_path) and (convert_mermaid or convert_tables):
-                tasks.append(
-                    self.process_image(
-                        img_name,
-                        img_path,
-                        output_dir,
-                        convert_mermaid=convert_mermaid,
-                        convert_tables=convert_tables,
-                    )
-                )
+                tasks.append(process_image_limited(img_name, img_path))
             elif os.path.exists(img_path):
                 # 只是修正路徑
                 img_rel_path = os.path.relpath(img_path, output_dir)
                 full_text = full_text.replace(f"![]({img_name})", f"![]({img_rel_path})")
                 
         if tasks:
-            logger.info(f"正在並發處理 {len(tasks)} 張圖片...")
+            logger.info(
+                f"正在並發處理 {len(tasks)} 張圖片 "
+                f"(上限 {settings.VISION_MAX_CONCURRENCY})..."
+            )
             results = await asyncio.gather(*tasks)
             for old_tag, new_tag in results:
                 full_text = full_text.replace(old_tag, new_tag)

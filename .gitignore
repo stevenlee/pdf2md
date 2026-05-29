@@ -12,9 +12,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.cache/
 
 # Docker 與本地日誌
 *.log
+logs/
 .docker-compose.lock
 
 # 系統雜訊

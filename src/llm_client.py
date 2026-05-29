@@ -3,6 +3,7 @@ import re
 import typer
 import base64
 import aiohttp
+import asyncio
 from pathlib import Path
 from openai import OpenAI
 import google.generativeai as genai
@@ -129,14 +130,30 @@ class LLMClient:
             
             endpoint = f"{settings.OLLAMA_API_BASE.rstrip('/')}/chat/completions"
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(endpoint, json=payload) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data["choices"][0]["message"]["content"]
-                    else:
-                        text = await response.text()
-                        raise Exception(f"Ollama API 錯誤: HTTP {response.status} - {text}")
+            timeout = aiohttp.ClientTimeout(total=settings.VISION_REQUEST_TIMEOUT)
+            attempts = max(1, settings.VISION_REQUEST_RETRIES + 1)
+            last_error = None
+
+            for attempt in range(attempts):
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(endpoint, json=payload) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                return data["choices"][0]["message"]["content"]
+
+                            text = await response.text()
+                            error = Exception(f"Ollama API 錯誤: HTTP {response.status} - {text}")
+                            if response.status not in (408, 429, 500, 502, 503, 504):
+                                raise error
+                            last_error = error
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_error = e
+
+                if attempt < attempts - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+            raise Exception(f"Ollama API 重試後仍失敗: {last_error}")
         return "Error: Async vision not supported for this provider yet."
 
     async def async_vision_classify(self, image_path: str) -> str:

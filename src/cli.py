@@ -6,6 +6,7 @@ from rich.console import Console
 from concurrent.futures import ThreadPoolExecutor
 import os
 import time
+import threading
 
 console = Console()
 
@@ -18,6 +19,7 @@ def batch_convert(
     tables: bool = typer.Option(True, "--tables/--no-tables", help="是否嘗試將表格圖片轉換為 Markdown table"),
     workers: int = typer.Option(4, "--workers", "-w", help="並行處理的執行緒數量"),
     force: bool = typer.Option(False, "--force", "-f", help="強制重新轉換已存在的檔案"),
+    keep_raw: bool = typer.Option(False, "--keep-raw/--no-keep-raw", help="是否保留第一階段產生的 *_raw.md 參考檔"),
 ):
     """
     批次將目錄中的 PDF 與圖片轉換為 Markdown。
@@ -44,7 +46,8 @@ def batch_convert(
         f"[green]找到 {len(pdf_files)} 個 PDF、{len(image_files)} 個圖片檔案，準備開始轉換...[/green]"
     )
 
-    converter: Optional[PDFConverter] = PDFConverter() if pdf_files else None
+    converter: Optional[PDFConverter] = None
+    converter_lock = threading.Lock()
 
     def process_file(input_path: Path):
         # 決定輸出子路徑以維持目錄結構
@@ -64,6 +67,11 @@ def batch_convert(
             
             if input_path.suffix.lower() == ".pdf":
                 # Stage 1: Physical Extraction
+                nonlocal converter
+                if converter is None:
+                    with converter_lock:
+                        if converter is None:
+                            converter = PDFConverter()
                 assert converter is not None
                 raw_md_path_str = converter.convert(str(input_path), str(target_subdir))
                 raw_md_path = Path(raw_md_path_str)
@@ -77,6 +85,8 @@ def batch_convert(
                     convert_mermaid=mermaid,
                     convert_tables=tables,
                 )
+                if not keep_raw and raw_md_path.exists():
+                    raw_md_path.unlink()
             else:
                 end_s1 = time.time()
                 final_md_path = enhancer.enhance_image(
@@ -107,6 +117,9 @@ def batch_convert(
             console.print(f"[blue]{res}[/blue]")
         else:
             console.print(f"[red]{res}[/red]")
+
+    if any(res.startswith("失敗:") for res in results):
+        raise typer.Exit(1)
 
 if __name__ == "__main__":
     typer.run(batch_convert)
