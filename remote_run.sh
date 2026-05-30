@@ -74,11 +74,17 @@ echo "📤 [2/4] 同步輸入檔案到遠端 $INPUT_DIR..."
 ssh "$REMOTE_USER@$REMOTE_HOST" "mkdir -p $REMOTE_DIR/$INPUT_DIR $REMOTE_DIR/$OUTPUT_DIR"
 rsync -az --delete "$LOCAL_DIR/$INPUT_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/$INPUT_DIR/"
 
+echo "🧹 [2.5/4] 清理 DGX 上先前殘留的 stale 轉換容器..."
+ssh "$REMOTE_USER@$REMOTE_HOST" "docker ps -a --filter 'name=pdf2md-pdf2md-run-' -q | xargs -r docker rm -f"
+
 echo "⚙️ [3/4] 在 DGX 上執行高效能轉換..."
 # Container 以 root 執行，輸出檔在 host 上會變成 root 所有 (清理時要 sudo)。
 # 轉換後在容器內把輸出/輸入目錄 chown 回遠端使用者 (容器內 root 有權限)，
 # 之後 host 一般帳號即可清除。chown 失敗不影響轉換結果碼。
+set +e
 ssh "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR && docker compose run --rm -e HOST_UID=\$(id -u) -e HOST_GID=\$(id -g) pdf2md bash -c 'python3 -m src.cli --input $INPUT_DIR --output $OUTPUT_DIR --workers $WORKERS $FORCE_FLAG $RAW_FLAG; rc=\$?; chown -R \$HOST_UID:\$HOST_GID $OUTPUT_DIR $INPUT_DIR 2>/dev/null || true; exit \$rc'"
+SSH_RC=$?
+set -e
 
 echo "📥 [4/4] 將成果收割回本地 $OUTPUT_DIR..."
 rsync -az "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/$OUTPUT_DIR/" "$LOCAL_DIR/$OUTPUT_DIR/"
@@ -94,4 +100,10 @@ fi
 ELAPSED=$(( $(date +%s) - START_TS ))
 printf '⏱️  總耗時: %02d:%02d:%02d (%d 秒) — 完成時間 %s\n' \
     $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)) "$ELAPSED" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+if [ $SSH_RC -ne 0 ]; then
+    echo "❌ 遠端轉換過程中發生錯誤或連線中斷 (Exit Code: $SSH_RC)，但已盡力將已生成的成果收割回本地。"
+    exit $SSH_RC
+fi
+
 echo "✅ 全部完成！請在 Obsidian 中打開 pdf2mdVault 資料夾查看成果。"
