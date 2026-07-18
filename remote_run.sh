@@ -90,6 +90,8 @@ val() { printf '%s\n' "$POLL_OUT" | sed -n "s/^$1://p"; }
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
 # 一次 ssh 抓齊：容器狀態 / 進度計數 / 完成碼 / 遠端時間。失敗回傳非 0。
+# TOTAL/DONEIMG 都只統計「最後一批 並發處理」(= 當前檔案)：DONEIMG 以 tac 取到
+# 最後一批起點、再以不重複圖片名計數，避免跨檔累計與 DIAGRAM 重試造成的虛胖。
 fetch_status() {
     POLL_OUT=$(ssh $SSH_OPTS "$RT" "
         cd $REMOTE_DIR 2>/dev/null || exit 0
@@ -97,7 +99,10 @@ fetch_status() {
         echo \"START:\$(cat '$START_REL' 2>/dev/null || true)\"
         echo \"RUNNING:\$(docker ps --filter '$CONTAINER_FILTER' -q 2>/dev/null | head -1)\"
         echo \"TOTAL:\$(grep -aoE '並發處理 [0-9]+ 張圖片' '$LOG_REL' 2>/dev/null | tail -1 | grep -aoE '[0-9]+' || true)\"
-        echo \"DONEIMG:\$(grep -acE '開始非同步轉換圖片' '$LOG_REL' 2>/dev/null || true)\"
+        echo \"NBATCH:\$(grep -acE '並發處理 [0-9]+ 張圖片' '$LOG_REL' 2>/dev/null || true)\"
+        echo \"DONEIMG:\$(tac '$LOG_REL' 2>/dev/null | sed -n '1,/並發處理/p' | grep -ao '圖片 [^ ]* 分類結果' | sort -u | wc -l || true)\"
+        echo \"FDONE:\$(grep -acE '完成(非同步增強|圖片增強)轉換' '$LOG_REL' 2>/dev/null || true)\"
+        echo \"FTOTAL:\$(ls '$INPUT_DIR' 2>/dev/null | wc -l || true)\"
         echo \"STAGE1:\$(grep -acE '開始物理萃取' '$LOG_REL' 2>/dev/null || true)\"
         echo \"LAST:\$(grep -aE 'INFO:|Recognizing|Detecting|OCR Error|Traceback|Error' '$LOG_REL' 2>/dev/null | tail -1 | cut -c1-120 || true)\"
         echo \"RC:\$(cat '$DONE_REL' 2>/dev/null || true)\"
@@ -138,7 +143,7 @@ monitor_and_harvest() {
     local mode="$1"
     local wait_start; wait_start=$(date +%s)
     local saw_running=0 gone=0 iter=0
-    local eta_t0="" eta_c0="" last_elapsed=0
+    local eta_t0="" eta_c0="" eta_total="" last_elapsed=0
     SSH_RC=""
 
     while true; do
@@ -149,12 +154,16 @@ monitor_and_harvest() {
         iter=$((iter + 1))
 
         local now start start_raw running total doneimg stage1 last rc elapsed
+        local nbatch fdone ftotal fileinfo
         now=$(val NOW);       is_num "$now"   || now=$(date +%s)
         start_raw=$(val START)
         start="$start_raw";   is_num "$start" || start="$now"
         running=$(val RUNNING)
         total=$(val TOTAL);   is_num "$total"     || total=0
         doneimg=$(val DONEIMG); is_num "$doneimg" || doneimg=0
+        nbatch=$(val NBATCH); is_num "$nbatch" || nbatch=0
+        fdone=$(val FDONE);   is_num "$fdone"  || fdone=0
+        ftotal=$(val FTOTAL); is_num "$ftotal" || ftotal=0
         stage1=$(val STAGE1); is_num "$stage1" || stage1=0
         last=$(val LAST)
         rc=$(val RC)
@@ -172,10 +181,21 @@ monitor_and_harvest() {
         fi
 
         # --- 顯示進度 ---
+        fileinfo=""
         if [ -n "$rc" ]; then
             :  # 已完成，下面統一處理
+        elif [ "$stage1" -gt "$nbatch" ]; then
+            # 已萃取檔數 > 已進入增強的檔數 → 下一個檔案的階段1進行中，
+            # 此時 TOTAL/DONEIMG 還是上一個檔案的殘值，不能拿來顯示。
+            [ "$ftotal" -gt 0 ] && fileinfo="檔案 $stage1/$ftotal | "
+            printf '🔄 [階段1/2 物理萃取 Marker] %s已用 %s | %s\n' \
+                "$fileinfo" "$(fmt "$elapsed")" "${last:-模型解析中…}"
         elif [ "$total" -gt 0 ]; then
             [ "$doneimg" -gt "$total" ] && doneimg=$total
+            # 換檔案 (批次大小改變或計數回退) → 重設 ETA 取樣基準
+            if [ "$total" != "$eta_total" ] || [ "$doneimg" -lt "${eta_c0:-0}" ]; then
+                eta_t0=""; eta_c0=""; eta_total=$total
+            fi
             local pct=$((doneimg * 100 / total))
             local eta="估算中"
             if [ -z "$eta_t0" ] && [ "$doneimg" -gt 0 ]; then eta_t0=$now; eta_c0=$doneimg; fi
@@ -183,12 +203,18 @@ monitor_and_harvest() {
                 # 首選：接上監看後的即時速率 (最貼近目前吞吐)。
                 local dc=$((doneimg - eta_c0)) dt=$((now - eta_t0))
                 eta="~$(fmt $(((total - doneimg) * dt / dc)))"
-            elif [ "$doneimg" -gt 0 ] && [ "$elapsed" -gt 0 ]; then
-                # 退而求其次：還沒有即時樣本時，用自啟動以來的平均速率給粗估 (下一輪起改用即時速率)。
+            elif [ "$fdone" = "0" ] && [ "$doneimg" -gt 0 ] && [ "$elapsed" -gt 0 ]; then
+                # 退而求其次：還沒有即時樣本時，用自啟動以來的平均速率給粗估
+                # (僅第一個檔案適用；後續檔案的 elapsed 含前面檔案的時間，估了反而誤導)。
                 eta="~$(fmt $(((total - doneimg) * elapsed / doneimg)))"
             fi
-            printf '🔄 [階段2/2 圖片增強] %d/%d (%d%%) | 已用 %s | 預估剩餘 %s\n' \
-                "$doneimg" "$total" "$pct" "$(fmt "$elapsed")" "$eta"
+            if [ "$ftotal" -gt 0 ]; then
+                local fcur=$((fdone + 1))
+                [ "$fcur" -gt "$ftotal" ] && fcur=$ftotal
+                fileinfo="檔案 $fcur/$ftotal | "
+            fi
+            printf '🔄 [階段2/2 圖片增強] %s本檔圖片 %d/%d (%d%%) | 已用 %s | 本檔預估剩餘 %s\n' \
+                "$fileinfo" "$doneimg" "$total" "$pct" "$(fmt "$elapsed")" "$eta"
         elif [ "$stage1" -gt 0 ]; then
             printf '🔄 [階段1/2 物理萃取 Marker] 已用 %s | %s\n' "$(fmt "$elapsed")" "${last:-模型解析中…}"
         else
